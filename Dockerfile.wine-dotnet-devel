@@ -1,0 +1,73 @@
+# Wine + .NET base image, built from the same recipe as ProteoWizard's
+# container/dotnet/Dockerfile but pinned to the WineHQ "devel" branch
+# instead of "staging". The staging branch carries an out-of-tree
+# patchset (ntdll-Junction_Points) that breaks symbolic-link reads in
+# msconvert / Skyline; the devel branch does not. See README.md and
+# wine-symlink-regression.txt for the full diagnosis.
+
+FROM ubuntu:20.04
+
+LABEL description="Wine with .NET (devel branch, symlink-safe)"
+LABEL website=https://github.com/ProteoWizard/container/dotnet
+LABEL documentation=https://github.com/ProteoWizard/container/dotnet
+
+ARG DEBIAN_FRONTEND="noninteractive"
+
+RUN dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y \
+        software-properties-common \
+        winbind \
+        cabextract \
+        p7zip \
+        unzip \
+        wget \
+        zenity \
+        xvfb && \
+    apt-get -y clean && \
+    rm -rf \
+      /var/lib/apt/lists/* \
+      /usr/share/doc \
+      /usr/share/doc-base \
+      /usr/share/man \
+      /usr/share/locale \
+      /usr/share/zoneinfo
+
+# THE FIX. Upstream uses WINEDISTRO=staging here.
+ENV WINEDISTRO=devel
+ENV WINEVERSION=10.6~focal-1
+
+RUN wget -nc https://dl.winehq.org/wine-builds/winehq.key \
+    && apt-key add winehq.key \
+    && apt-get update \
+    && apt-get install -y apt-transport-https \
+    && add-apt-repository https://dl.winehq.org/wine-builds/ubuntu/ \
+    && apt-get update \
+    && apt-get install -y --allow-unauthenticated --install-recommends \
+        winehq-$WINEDISTRO=$WINEVERSION \
+        wine-$WINEDISTRO=$WINEVERSION \
+        wine-$WINEDISTRO-i386=$WINEVERSION \
+        wine-$WINEDISTRO-amd64=$WINEVERSION && \
+    apt-get -y clean && \
+    rm -rf \
+      /var/lib/apt/lists/* \
+      /usr/share/doc \
+      /usr/share/doc-base \
+      /usr/share/man \
+      /usr/share/locale \
+      /usr/share/zoneinfo \
+      && \
+    wget https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks \
+      -O /usr/local/bin/winetricks && chmod +x /usr/local/bin/winetricks
+
+ENV WINEDEBUG -all,err+all
+
+RUN mkdir -p /wineprefix64/
+ENV WINEPREFIX /wineprefix64
+WORKDIR /wineprefix64
+
+RUN winetricks -q dotnet48 && wineserver -w \
+    && winetricks -q win7 \
+    && xvfb-run winetricks -q vcrun2008 vcrun2017 corefonts \
+    && wineserver -w \
+    && rm -fr /root/.cache/winetricks

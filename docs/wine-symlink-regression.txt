@@ -1,0 +1,653 @@
+================================================================================
+ProteoWizard Docker container: symbolic-link reads broken after Wine 10.6
+upgrade (commit 489b8c0 in ProteoWizard/container)
+================================================================================
+
+NOTE ON THIS WORKING TREE (added during cleanup)
+------------------------------------------------
+This document references two helper directories that were part of the
+diagnostic process but have since been removed from this working tree:
+
+  * wine-symlink-test/    -- minimal Wine images plus a Win32 metadata
+                             probe (probe.c / probe.exe) used to isolate
+                             the bug to path-based APIs only. Its outputs
+                             are preserved inline in the VERIFICATION
+                             section below.
+  * pwiz-fixed-build/     -- single Dockerfile for the original
+                             "derived" fix (FROM upstream + apt-swap to
+                             wine-devel). Superseded by the from-source
+                             rebuild documented in the project README.
+
+The diagnosis and the build that ships are unaffected -- the harnesses
+were only needed during the investigation.
+
+SUMMARY
+-------
+After commit 489b8c0 ("updated wine-dotnet to 10.6 and staging branch"), the
+ProteoWizard Docker container can no longer correctly handle input files
+that are symbolic links on the host filesystem. msconvert, Skyline, and
+presumably every other binary in the image are affected.
+
+The precise scope of the bug, as confirmed empirically (see VERIFICATION
+section), is narrower than "all file APIs lie about symlinks". It is
+specifically the PATH-BASED metadata APIs that return wrong information:
+
+    GetFileAttributes / GetFileAttributesEx  -> size 0, FILE_ATTRIBUTE_REPARSE_POINT set
+    FindFirstFile / FindNextFile             -> size 0, FILE_ATTRIBUTE_REPARSE_POINT set
+
+HANDLE-based APIs (GetFileSize / GetFileSizeEx / GetFileInformationByHandle
+on a HANDLE returned by CreateFile), ReadFile, SetFilePointer, and
+CreateFileMapping/MapViewOfFile all work correctly: they return the
+target's real size and contents.
+
+The user-visible failure surface is therefore code -- in pwiz, in vendor
+SDK DLLs, or in .NET -- that asks "how big is this file?" by PATH before
+opening it. Common cases:
+
+  * .NET: System.IO.FileInfo.Length is a path-based GetFileAttributesEx
+    call. Any Skyline (or other .NET) code that does
+        new FileInfo(path).Length
+    on a symlinked vendor file gets back 0.
+
+  * Closed-source vendor SDKs (Thermo RawFileReader, Bruker CompassXtract,
+    Waters RawData, Agilent MassHunter, Sciex). Any SDK whose flow is
+    "GetFileAttributesEx(path) -> size buffer / locate trailing index
+    offset -> CreateFile -> read" sees size 0 and aborts before opening.
+
+  * Bruker .d, Waters .raw, Agilent .d directory bundles: FindFirstFile /
+    FindNextFile enumeration of the directory's contents reports any
+    component file that is itself a symlink as 0 bytes. This is a real
+    container-deployment scenario because the pwiz container's own README
+    notes the use of archivemount for tar'd vendor directories, and
+    HPC/NFS layouts commonly stage data through symlinks.
+
+The regression is not caused by the Wine version bump itself (7.8 -> 10.6).
+It is caused by the simultaneous switch of the WineHQ branch from "devel" to
+"staging". Wine-staging carries an out-of-tree patchset
+(patches/ntdll-Junction_Points/) that changes how Wine reports Unix symlinks
+to Windows applications. That patchset was active in wine-staging v10.6 and
+was disabled upstream on 2025-11-12, starting with wine-staging v10.19.
+
+Both proposed fixes were verified empirically with synthetic Wine test
+images (see VERIFICATION section). The "switch from staging to devel at
+the same Wine version 10.6 on the same focal base" fix was then verified
+end-to-end against the actual published pwiz image -- the patched image
+was built and confirmed to read real Thermo .raw files accessed via
+symbolic links correctly (see END-TO-END VERIFICATION ON THE ACTUAL
+PWIZ IMAGE section).
+
+
+POSSIBLE FIXES
+--------------
+1. [VERIFIED END-TO-END] Switch back to WINEDISTRO=devel at the same
+   Wine version, on the same focal base.
+   In container/dotnet/Dockerfile, change just one line:
+       ENV WINEDISTRO=staging      ->      ENV WINEDISTRO=devel
+   Keep WINEVERSION=10.6~focal-1 and the ubuntu:20.04 base unchanged.
+   Mainline Wine does not carry the ntdll-Junction_Points patchset, so
+   symlinks are followed transparently. This was verified end-to-end:
+   a derived image built FROM the upstream pwiz image with the wine
+   packages apt-swapped from staging to devel reads symlinked vendor
+   files correctly, where the upstream image returns 0 bytes.
+   Trade-off: loses any staging-only benefits (e.g. whatever change in
+   the staging tree improved Thermo performance and motivated the
+   original move to staging).
+
+2. Upgrade wine-staging to v10.19 or newer (requires base image bump).
+   The breaking patchset is marked "Disabled: True" in wine-staging
+   starting at v10.19, and mainline Wine's own reparse-point
+   implementation (which lands at the same time) deliberately does NOT
+   treat bare Unix symlinks as NT reparse points -- so normal "ln -s"
+   symlinks are once again followed transparently. Verified with a
+   minimal Wine test image (synthetic fixture only -- not yet tested
+   end-to-end with real pwiz binaries since the published pwiz image is
+   focal-based).
+   Caveat: WineHQ stopped publishing focal builds after v10.6, so this
+   requires rebasing container/dotnet/Dockerfile from ubuntu:20.04 to
+   ubuntu:22.04 (jammy) or ubuntu:24.04 (noble). Both have wine-staging
+   builds through 11.7+ available.
+
+3. [PARTIAL WORKAROUND] Stay on wine-staging v10.6 and resolve symlinks
+   before Wine sees them. A wrapper around msconvert/Skyline could run
+   each path argument through "readlink -f" before passing it on. Does
+   not help when an application discovers symlinks itself during a
+   directory scan (e.g. Skyline "Open Folder", Bruker .d / Waters .raw
+   directory bundles that contain internal symlinks), so it is at best
+   a partial fix.
+
+Recommended: option 1. It is the smallest possible diff (a single ENV
+line in container/dotnet/Dockerfile), it has been empirically verified
+end-to-end on the published pwiz image, it requires no base-image
+rebase, and the only known cost is losing whatever staging-only benefit
+motivated the original switch.
+
+
+DETAILED EXPLANATION
+--------------------
+
+What changed in commit 489b8c0
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Dockerfile change in container/dotnet/Dockerfile was:
+
+    Before:
+        ENV WINEDISTRO=devel
+        ENV WINEVERSION=7.8~focal-1
+
+    After:
+        ENV WINEDISTRO=staging
+        ENV WINEVERSION=10.6~focal-1
+
+The branch change (devel -> staging) is the load-bearing change here, not the
+version number. Wine-staging is wine + a large set of out-of-tree patches that
+mainline Wine does not carry. One of those patchsets,
+patches/ntdll-Junction_Points/, was previously experimental and "Disabled" in
+the staging tree, then re-enabled in 2020, and stayed enabled through
+v10.18. It was disabled again on 2025-11-12, starting with v10.19. The
+container's pinned v10.6 lands squarely inside the enabled window.
+
+What the patchset does to symlinks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+At wine-staging v10.6 the patchset contains 26 patches (0001 - 0026). Three
+of them, taken together, fully account for the breakage:
+
+  * 0015-ntdll-Always-report-symbolic-links-as-containing-zero-bytes.patch
+    In dlls/ntdll/unix/file.c, both fd_get_file_info() and get_file_info()
+    now do this whenever the underlying inode is a symlink:
+
+        /* symbolic links (either junction points or NT symlinks)
+           are "reparse points" */
+        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+        /* symbolic links always report size 0 */
+        st->st_size = 0;
+
+    The Windows application sees a file with FILE_ATTRIBUTE_REPARSE_POINT set
+    and nFileSizeLow/High = 0.
+
+  * New FD_TYPE_SYMLINK in the wineserver
+    server/file.c and server/protocol.def grow a new fd type, and the server
+    now classifies any handle whose backing inode is a symlink as
+    FD_TYPE_SYMLINK rather than FD_TYPE_FILE:
+
+        if (S_ISLNK(file->mode)) return FD_TYPE_SYMLINK;
+
+    Without these patches, S_ISLNK was effectively unreachable here because
+    open() follows symlinks by default; the type was always FD_TYPE_FILE.
+
+  * 0017-ntdll-Succeed-with-no-data-for-NtReadFile-on-reparse-points.patch
+    NtReadFile short-circuits on the new fd type:
+
+        else if (type == FD_TYPE_SYMLINK)
+        {
+            status = STATUS_SUCCESS;
+            goto done;
+        }
+
+    Reads from a symlink-backed handle return STATUS_SUCCESS with zero bytes
+    transferred.
+
+End-to-end failure mode
+~~~~~~~~~~~~~~~~~~~~~~~
+1. A user mounts a host directory into the container, e.g.
+   "-v /host/data:/data", where /host/data/sample.raw is a symlink to a real
+   file elsewhere on the host.
+2. msconvert/Skyline (or a vendor SDK on its behalf) calls a PATH-based
+   metadata API on Z:\data\sample.raw -- GetFileAttributesEx,
+   FindFirstFile, GetFileAttributes, or any wrapper around them
+   (boost::filesystem::file_size, std::filesystem::file_size,
+   System.IO.FileInfo.Length, etc.).
+3. Wine's get_file_info() does an lstat on the path, sees S_ISLNK,
+   force-clamps the reported size to 0, and ORs FILE_ATTRIBUTE_REPARSE_POINT
+   into the returned attributes.
+4. The application sees what looks like a 0-byte reparse point and aborts
+   before opening the file -- typical failure modes:
+     - "file is empty / unreadable"
+     - "invalid header" (because the SDK seeks to size-NN to find a footer
+       and reads garbage when size is 0)
+     - in .NET: surfaces as 0 from FileInfo.Length, breaking any
+       size-driven Skyline logic
+     - in Bruker/Waters/Agilent directory bundles: each component file
+       inside the .d/.raw/.d directory enumerates as 0 bytes if it's a
+       symlink, and the SDK rejects the bundle as malformed.
+
+Critical refinement: HANDLE-based queries are NOT broken. If code does
+"CreateFile -> GetFileSizeEx(handle)" instead of "GetFileAttributesEx(path)",
+it gets the correct size. Reads, seeks, and memory mappings all work
+correctly through a handle. The bug is exclusively in the path-based
+metadata code path, which sits BEFORE the handle exists. This is also why
+naive "open and copy through" code (e.g. cmd /c type) works fine on the
+broken image -- it never asks for the size.
+
+Under wine-devel (any version, any base image), none of these patches
+exist, so lstat returns the target's real size and applications work
+correctly.
+
+Why path-resolution patches in the same patchset don't save us
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The patchset does include 0011-ntdll-Follow-reparse-points-during-path-
+resolution.patch, but it only handles Wine-internal reparse-point formats
+(IO_REPARSE_TAG_SYMLINK / IO_REPARSE_TAG_MOUNT_POINT created by Wine itself).
+Bare Linux symlinks created by "ln -s" are reported via patch 0025 as
+IO_REPARSE_TAG_LX_SYMLINK (the WSL tag), which Windows applications that have
+no idea about WSL semantics simply don't handle. The result is the empty-file
+behaviour above.
+
+Why this also impacts the "Thermo performance" reasoning in the commit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The commit message notes that the staging branch in particular seemed to
+improve Thermo performance. That benefit almost certainly comes from a
+different, unrelated patch in the staging tree. Adopting staging brought the
+symlink-breaking patches along with it as a side effect.
+
+Upstream status of the patchset
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The wine-staging maintainers added "Disabled: True" to
+patches/ntdll-Junction_Points/definition in commit 514e3884 on 2025-11-12,
+in the rebase that became the v10.19 release on 2025-11-14. The patchset is
+disabled in v10.19, v10.20, v11.0 and every release since. This was done in
+coordination with mainline Wine landing its own reparse-point support in
+10.19, which was designed to leave bare Unix symlinks transparent rather than
+expose them as NT reparse points -- exactly the property pwiz needs.
+
+
+VERIFICATION
+------------
+Three minimal Docker images were built to reproduce the regression and
+verify the proposed fixes. Each image installs only Wine -- no winetricks,
+no dotnet, no pwiz binaries -- because the bug is reproducible at the
+level of plain Win32 file APIs and does not need any vendor reader to
+manifest.
+
+Image matrix:
+
+  +-----+----------------------------+-------------+------------------+
+  | #   | Image tag                  | Base image  | Wine package     |
+  +-----+----------------------------+-------------+------------------+
+  | (1) | wine-broken-staging        | ubuntu:20.04| wine-staging     |
+  |     |                            |  (focal)    |  10.6~focal-1    |
+  | (2) | wine-fix-devel-same-ver    | ubuntu:20.04| wine-devel       |
+  |     |                            |  (focal)    |  10.6~focal-1    |
+  | (3) | wine-fix-staging-newer     | ubuntu:22.04| wine-staging     |
+  |     |                            |  (jammy)    |  11.7~jammy-1    |
+  +-----+----------------------------+-------------+------------------+
+
+Image (1) reproduces the current ProteoWizard container's Wine setup
+exactly. Image (2) holds Wine version and base image constant and changes
+only the WineHQ branch (staging -> devel). Image (3) keeps the staging
+branch but moves to a Wine version released after the patchset was
+disabled upstream (and therefore requires the jammy base, since WineHQ
+no longer publishes builds for focal past 10.6).
+
+The relevant Dockerfile body is identical across images apart from the
+base image and the two ENV lines, e.g.:
+
+    FROM ubuntu:20.04
+    ARG DEBIAN_FRONTEND=noninteractive
+    ENV WINEDISTRO=staging
+    ENV WINEVERSION=10.6~focal-1
+    RUN dpkg --add-architecture i386 && apt-get update && \
+        apt-get install -y --no-install-recommends \
+            software-properties-common winbind wget gnupg \
+            ca-certificates apt-transport-https && \
+        wget -nc https://dl.winehq.org/wine-builds/winehq.key && \
+        apt-key add winehq.key && \
+        add-apt-repository https://dl.winehq.org/wine-builds/ubuntu/ && \
+        apt-get update && \
+        apt-get install -y --allow-unauthenticated --install-recommends \
+            winehq-${WINEDISTRO}=${WINEVERSION} \
+            wine-${WINEDISTRO}=${WINEVERSION} \
+            wine-${WINEDISTRO}-amd64=${WINEVERSION}
+    ENV WINEDEBUG=-all
+    ENV WINEPREFIX=/wineprefix64
+    ENV WINEDLLOVERRIDES="mscoree,mshtml="
+    RUN wineboot --init && wineserver -w
+    WORKDIR /data
+
+Build commands:
+
+    docker build -f Dockerfile.broken-staging      -t wine-broken-staging      .
+    docker build -f Dockerfile.fix-devel-same-ver  -t wine-fix-devel-same-ver  .
+    docker build -f Dockerfile.fix-staging-newer   -t wine-fix-staging-newer   .
+
+Test fixture (created on the host):
+
+    mkdir fixture
+    printf 'HELLO_FROM_TARGET_FILE_1777676534\n' > fixture/target.txt   # 34 bytes
+    ln -s target.txt fixture/link.txt
+
+Three Win32 file-metadata code paths were exercised against link.txt by
+running cmd.exe inside Wine, with fixture/ bind-mounted at /data:
+
+    PROBE A:  wine cmd /c type 'Z:\data\link.txt'
+              -> exercises CreateFile + ReadFile (path resolution)
+
+    PROBE B:  wine cmd /v:on /c 'for %f in (Z:\data\link.txt) do @echo %~zf'
+              -> exercises GetFileAttributesEx (file-size query)
+
+    PROBE C:  wine cmd /c dir 'Z:\data\link.txt'
+              -> exercises FindFirstFile (directory enumeration)
+
+Each probe was launched as:
+
+    docker run --rm -v "$(pwd)/fixture":/data:ro <IMAGE> wine cmd ...
+
+Raw observed output
+~~~~~~~~~~~~~~~~~~~
+
+(1) wine-broken-staging  (current container Wine: staging 10.6 / focal):
+
+    PROBE A (type)   : HELLO_FROM_TARGET_FILE_1777676534
+    PROBE B (%~zf)   : 0
+    PROBE C (dir)    : 05/01/2026  11:02 PM  <SYMLINK>     link.txt
+                       0 files                        0 bytes
+
+(2) wine-fix-devel-same-ver  (devel branch, same version, same base):
+
+    PROBE A (type)   : HELLO_FROM_TARGET_FILE_1777676534
+    PROBE B (%~zf)   : 34
+    PROBE C (dir)    : 05/01/2026  11:02 PM                34 link.txt
+                       1 file                        34 bytes
+
+(3) wine-fix-staging-newer  (staging 11.7, jammy base):
+
+    PROBE A (type)   : HELLO_FROM_TARGET_FILE_1777676534
+    PROBE B (%~zf)   : 34
+    PROBE C (dir)    : 05/01/2026  11:02 PM                34 link.txt
+                       1 file                        34 bytes
+
+Results table:
+
+  +----------------------+--------------+------------------+--------------------+
+  | Image                | A: type      | B: %~zf size     | C: dir             |
+  |                      |  (ReadFile)  |  (GetAttrEx)     |  (FindFirstFile)   |
+  +----------------------+--------------+------------------+--------------------+
+  | wine-broken-staging  | content OK   |  0    (BROKEN)   |  <SYMLINK> 0 bytes |
+  |                      |              |                  |    (BROKEN)        |
+  | wine-fix-devel-      | content OK   |  34   (correct)  |  34 bytes          |
+  |   same-ver           |              |                  |    (correct)       |
+  | wine-fix-staging-    | content OK   |  34   (correct)  |  34 bytes          |
+  |   newer              |              |                  |    (correct)       |
+  +----------------------+--------------+------------------+--------------------+
+
+Interpretation
+~~~~~~~~~~~~~~
+
+PROBE A (type) returns the correct content on ALL THREE images. This was
+initially surprising but is consistent with patch 0011's behavior of
+following reparse points during path resolution -- naive
+"open-and-read-sequentially" code is unaffected. This is why a test that
+only reads the file would falsely conclude there is no bug.
+
+PROBE B (GetFileAttributesEx via "%~zf") and PROBE C (FindFirstFile via
+"dir") are where the regression bites. The broken image reports the
+symlink as a 0-byte file with the SYMLINK / reparse-point flag set --
+exactly the failure mode that kills vendor mass-spec readers, which size
+buffers and locate index/footer offsets from the file size before
+issuing reads.
+
+Both fix paths -- (2) staging -> devel at the same version, and (3) the
+staging upgrade to 11.7 -- restore correct metadata reporting. Fix (2)
+is the cleanest controlled experiment, isolating the cause to the
+WineHQ branch (and therefore to the staging-only
+patches/ntdll-Junction_Points/ patchset) rather than to the Wine
+version or base image.
+
+Refined probe: handle-based vs path-based APIs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The cmd-based probes above raised a question: are HANDLE-based size
+queries (the ones a vendor SDK would use after CreateFile) also broken,
+or only path-based ones? To answer this, a small Win32 C program
+(probe.exe) was compiled with mingw and run against the same fixture
+inside each Wine image. The probe exercises:
+
+    GetFileAttributesEx(path)          -- path-based
+    FindFirstFile(path)                -- path-based
+    CreateFile(path) + GetFileSize(h)  -- handle-based
+    CreateFile(path) + GetFileSizeEx(h)
+    GetFileInformationByHandle(h)
+    SetFilePointerEx(h, size-16) + ReadFile  -- footer-style read
+    CreateFileMapping(h) + MapViewOfFile     -- memory mapping
+
+Output on wine-broken-staging, probing Z:\data\link.txt (the symlink):
+
+    GetFileAttributesEx     : size=0   attrs=0x00000420 REPARSE_POINT
+    FindFirstFile           : size=0   attrs=0x00000420 REPARSE_POINT
+    GetFileSize (handle)    : size=34
+    GetFileSizeEx (handle)  : size=34
+    GetFileInformationByHnd : size=34  attrs=0x00000020         (no REPARSE_POINT!)
+    Seek-to-end-16 + Read   : got 16 bytes: 'FILE_1777676534.'
+    MapViewOfFile           : OK  region size=4096
+
+Output on wine-broken-staging, probing Z:\data\target.txt (the regular
+file directly), and on both fix images probing either path:
+
+    GetFileAttributesEx     : size=34  attrs=0x00000020
+    FindFirstFile           : size=34  attrs=0x00000020
+    GetFileSize (handle)    : size=34
+    GetFileSizeEx (handle)  : size=34
+    GetFileInformationByHnd : size=34  attrs=0x00000020
+    Seek-to-end-16 + Read   : got 16 bytes: 'FILE_1777676534.'
+    MapViewOfFile           : OK  region size=4096
+
+Conclusions from the refined probe:
+
+  * The bug is strictly path-based. Any code that opens the file first
+    (CreateFile) and queries metadata on the resulting HANDLE gets the
+    correct size and does NOT see the REPARSE_POINT flag. Reads and
+    memory mappings on the handle work correctly.
+  * This narrows the "who breaks" question dramatically. SDK code shaped
+    like "open then ask handle" is unaffected. SDK code (or .NET, or
+    pwiz-side) shaped like "ask path, then open" is broken.
+
+Where this maps to in pwiz / Skyline / vendor SDKs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A targeted source review of pwiz (paths under
+pwiz/pwiz/data/vendor_readers/ and pwiz/pwiz/utility/misc/) found:
+
+  * The vendor identify() methods in pwiz are largely innocent. Most
+    use bfs::exists() / bfs::is_directory() (boolean returns -- not
+    affected by the size-0 lie) or just check filename extensions:
+      - Reader_Thermo.cpp        : header-only check
+      - Reader_ABI.cpp           : extension check
+      - Reader_Shimadzu.cpp      : extension check
+      - Reader_Mobilion.cpp      : header + extension
+      - Reader_UNIFI.cpp         : HTTP URL check
+      - Reader_Agilent.cpp       : bfs::exists on AcqData/*.bin
+      - Reader_Bruker.cpp        : bfs::exists on Analysis.{tdf,tsf,baf,...}
+
+  * Reader_Waters.cpp uses pwiz::util::expand_pathmask() (which calls
+    FindFirstFileExW / FindNextFileW) to look for _FUNC*.DAT inside a
+    .raw directory. Enumeration still returns the entries on broken
+    Wine, but with size=0 + REPARSE_POINT for any symlinked entry --
+    relevant for archivemount / NFS-staged Waters bundles.
+
+  * Filesystem.cpp:215 in pwiz utility code does call GetFileSize on a
+    HANDLE, but our probe shows handle-based size is correct, so this
+    path is unaffected.
+
+The likely real failure points are therefore:
+
+  1. Closed-source vendor SDK DLLs that "GetFileAttributesEx(path) ->
+     CreateFile -> read footer at size-N". We cannot inspect these, but
+     given the user-reported breakage spans multiple vendors, at least
+     one common pattern of this shape almost certainly exists.
+
+  2. Skyline (.NET): System.IO.FileInfo.Length is path-based and would
+     return 0 for any symlinked vendor file. Any Skyline code path that
+     reads .Length on the input file before opening it is broken.
+
+  3. Directory-bundle enumeration on Bruker .d / Waters .raw / Agilent
+     .d, when component files inside are symlinks (a real scenario for
+     archivemount-tar'd or NFS-staged data, mentioned in the pwiz
+     container README itself).
+
+Reproducing the experiment
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+The three Dockerfiles, the cmd-based test script, the Win32 C probe,
+and the mingw build image live alongside this report:
+
+    wine-symlink-test/Dockerfile.broken-staging
+    wine-symlink-test/Dockerfile.fix-devel-same-ver
+    wine-symlink-test/Dockerfile.fix-staging-newer
+    wine-symlink-test/Dockerfile.probe-build       (mingw cross compiler)
+    wine-symlink-test/probe.c                      (Win32 metadata probe)
+    wine-symlink-test/run-test.sh                  (cmd-based driver)
+
+Build cost is roughly 3-5 min and ~400 MB of WineHQ packages per image.
+
+
+END-TO-END VERIFICATION ON THE ACTUAL PWIZ IMAGE
+------------------------------------------------
+The synthetic Wine test images above isolate the bug to the staging-only
+ntdll-Junction_Points patchset, but they do not exercise the actual
+pwiz/Skyline binaries. To close that gap, a derived "fixed" image was
+built FROM the published pwiz image, swapping only the WineHQ branch
+from staging to devel at the SAME Wine version on the SAME focal base.
+The pwiz binaries, the wineprefix, the dotnet48/winetricks state, and
+everything else are inherited unchanged from the upstream image. The
+only difference between the original and the fixed image is the four
+WineHQ apt packages.
+
+Base image used
+~~~~~~~~~~~~~~~
+  Repository : proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses
+  Tag        : latest  (also tagged 3.0.26120-bb3c999)
+  Pwiz build : 3.0.26120, git hash bb3c999
+  Digest     : sha256:7ecac062373732b14be83564b02cdc8c919b9748bc83dd8b71afca20d14d0535
+  Created    : 2026-05-01
+
+For a fully reproducible build, pin by digest in the FROM line:
+
+  FROM proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses@sha256:7ecac062373732b14be83564b02cdc8c919b9748bc83dd8b71afca20d14d0535
+
+Build recipe (pwiz-fixed-build/Dockerfile)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  FROM proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses:latest
+
+  RUN set -eux; \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+          wget gnupg ca-certificates apt-transport-https \
+          software-properties-common; \
+      wget -nv -O /tmp/winehq.key https://dl.winehq.org/wine-builds/winehq.key; \
+      apt-key add /tmp/winehq.key; \
+      add-apt-repository "deb https://dl.winehq.org/wine-builds/ubuntu/ focal main"; \
+      apt-get update; \
+      \
+      # Remove wine-staging packages but keep the wineprefix at /wineprefix64
+      # untouched. The prefix data format is compatible across staging/devel
+      # at the same Wine version, so dotnet48 and other winetricks state
+      # remain valid.
+      apt-get remove -y --purge \
+          winehq-staging \
+          wine-staging \
+          wine-staging-amd64 \
+          wine-staging-i386 \
+          || true; \
+      \
+      # Install wine-devel 10.6~focal-1 (the exact same Wine version, just
+      # the mainline branch with no out-of-tree patches).
+      apt-get install -y --allow-unauthenticated --install-recommends \
+          winehq-devel=10.6~focal-1 \
+          wine-devel=10.6~focal-1 \
+          wine-devel-amd64=10.6~focal-1 \
+          wine-devel-i386=10.6~focal-1; \
+      \
+      apt-get clean; \
+      rm -rf /var/lib/apt/lists/* /tmp/winehq.key
+
+Build cost is roughly 1 minute (apt-only, no winetricks). The wineprefix
+was originally created under wine-staging but is reused as-is under
+wine-devel without rebuild; in practice this works because the prefix
+on-disk format is the same across the two branches at the same upstream
+Wine version, and the dotnet48 / vcrun / corefonts winetricks state is
+preserved.
+
+Note on the wine64_anyuser shim
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The published pwiz image's default CMD is:
+
+    CMD ["wine64_anyuser", "msconvert"]
+
+This calls "sudo -E -H -u root wine64", but modern Wine (any branch,
+9.x+) merged the wow64 architecture: there is no "wine64" binary
+anymore, only "wine", which handles both 32-bit and 64-bit code. As a
+result, "wine64_anyuser" returns "sudo: wine64: command not found" in
+both the original AND the fixed images. The working entrypoint is
+"wine_anyuser" (without the 64). This is independent of the symlink
+regression but is worth fixing in container/Dockerfile in the same
+release.
+
+Probe results inside the actual pwiz images
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The same probe.exe used in the synthetic Wine tests was run inside both
+the original (broken) pwiz image and the derived fixed image, against
+the same Z:\data\link.txt symlink fixture:
+
+  +--------------------------+--------------------------+--------------------------+
+  | Probe                    | Original pwiz image      | Fixed pwiz image         |
+  |                          | (staging 10.6 focal)     | (devel 10.6 focal)       |
+  +--------------------------+--------------------------+--------------------------+
+  | GetFileAttributesEx      | size=0  REPARSE_POINT    | size=34                  |
+  | FindFirstFile            | size=0  REPARSE_POINT    | size=34                  |
+  | GetFileSize (handle)     | size=34                  | size=34                  |
+  | GetFileSizeEx (handle)   | size=34                  | size=34                  |
+  | GetFileInformationByHnd  | size=34                  | size=34                  |
+  | Seek-to-end-16 + Read    | got 16 bytes (correct)   | got 16 bytes (correct)   |
+  | MapViewOfFile            | OK                       | OK                       |
+  +--------------------------+--------------------------+--------------------------+
+
+Same pwiz binaries, same focal base, same Wine version. Only the WineHQ
+branch differs (staging vs devel). Path-based metadata APIs go from
+broken to correct. Confirms that the bug is exclusively in the
+staging-only ntdll-Junction_Points patchset and that simply swapping
+the apt branch fixes it.
+
+Real-world confirmation
+~~~~~~~~~~~~~~~~~~~~~~~
+The patched image was built using the recipe above and tested against
+an actual Thermo .raw file accessed via a symbolic link. msconvert read
+the file correctly, whereas the unmodified upstream image returns 0
+bytes for the same input. This closes the loop from synthetic-API probe
+to real-vendor-file processing.
+
+Reproducing the fixed-image build
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The build directory is in:
+
+    pwiz-fixed-build/Dockerfile
+
+To build and run:
+
+    docker build -t pwiz-fixed-devel:latest pwiz-fixed-build/
+    docker run --rm -v /path/to/host/data:/data \
+        pwiz-fixed-devel:latest \
+        wine_anyuser msconvert /data/your-symlinked-file.raw -o /data/out
+
+(Use wine_anyuser, not wine64_anyuser -- see the note above.)
+
+
+REFERENCES
+----------
+  Container commit that introduced the regression:
+    https://github.com/ProteoWizard/container/commit/489b8c0
+
+  wine-staging patchset at v10.6 (broken; patchset enabled):
+    https://github.com/wine-staging/wine-staging/tree/v10.6/patches/ntdll-Junction_Points
+
+  Specific patches:
+    https://github.com/wine-staging/wine-staging/blob/v10.6/patches/ntdll-Junction_Points/0015-ntdll-Always-report-symbolic-links-as-containing-zer.patch
+    https://github.com/wine-staging/wine-staging/blob/v10.6/patches/ntdll-Junction_Points/0017-ntdll-Succeed-with-no-data-for-NtReadFile-on-reparse.patch
+    https://github.com/wine-staging/wine-staging/blob/v10.6/patches/ntdll-Junction_Points/0011-ntdll-Follow-reparse-points-during-path-resolution.patch
+
+  wine-staging patchset at v10.19 (fixed; patchset disabled):
+    https://github.com/wine-staging/wine-staging/blob/v10.19/patches/ntdll-Junction_Points/definition
+
+  Mainline Wine reparse-point work:
+    https://gitlab.winehq.org/wine/wine/-/merge_requests/8688
+
+  Wine 10.19 release coverage:
+    https://linuxiac.com/wine-10-19-released-with-reparse-point-support/
