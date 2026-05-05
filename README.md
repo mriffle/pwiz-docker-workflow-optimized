@@ -1,9 +1,9 @@
-# pwiz-symlink-fix
+# pwiz-docker-workflow-optimized
 
 A drop-in replacement for the official ProteoWizard / Skyline Docker image that
 fixes a regression in which msconvert and Skyline silently mis-read input files
-accessed through symbolic links. Tailored for our workflow (Skyline + msconvert
-+ BlibBuild, all vendor formats), so it ships smaller than upstream while
+accessed through symbolic links. Tailored for our workflow (Skyline, msconvert,
+BlibBuild, and all vendor formats), so it ships smaller than upstream while
 keeping every feature we use.
 
 ## The problem
