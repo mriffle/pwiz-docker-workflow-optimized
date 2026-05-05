@@ -10,7 +10,7 @@ keeping every feature we use.
 
 In May 2026 the ProteoWizard container repo
 ([commit 489b8c0](https://github.com/ProteoWizard/container/commit/489b8c0))
-switched its WineHQ branch from `devel` to `staging` (Wine 7.8 → 10.6) to chase
+switched its WineHQ branch from `devel` to `staging` (Wine 7.8 → 10.6) to gain
 a Thermo performance improvement. Wine-staging carries a large set of
 out-of-tree patches that mainline Wine does not. One of them
 (`patches/ntdll-Junction_Points/`) makes Wine lie to Windows applications about
